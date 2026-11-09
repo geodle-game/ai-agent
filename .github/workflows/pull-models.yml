@@ -1,51 +1,59 @@
 name: Pull & Split Models
 
 on:
-  workflow_dispatch:   # manual trigger from the Actions tab
+  workflow_dispatch:
 
 permissions:
-  contents: write      # allows the job to commit chunks back to the repo
+  contents: write
 
 jobs:
   pull-and-split:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Hugging Face CLI
-        run: pip install huggingface_hub
+      - name: Install HF CLI
+        run: pip install -q huggingface_hub
 
-      - name: Download Nanbeige4.2-3B GGUF
+      - name: Download Nanbeige Q2_K (any filename)
         run: |
-          # Q2_K (1.76 GB) is the smallest listed quant.
-          # Swap to Q3_K_S (2.00 GB) if you want slightly better quality.
           hf download tinyopsec/Nanbeige4.2-3B-GGUF \
-            Nanbeige4.2-3B-Q2_K.gguf \
+            --include "*Q2_K*" \
             --local-dir ./downloaded
+          echo "Downloaded Nanbeige files:"
+          find ./downloaded -name '*.gguf' -ls
 
-      - name: Download Needle 2
+      - name: Download Needle 2 (any .cact)
         run: |
-          hf download Cactus-Compute/needle2 needle2.cact --local-dir ./downloaded
+          hf download Cactus-Compute/needle2 \
+            --include "*.cact" \
+            --local-dir ./downloaded
+          echo "Downloaded Needle files:"
+          find ./downloaded -name '*.cact' -ls
 
-      - name: Get llama.cpp splitter
+      - name: Resolve downloaded filenames
         run: |
-          # Pull a prebuilt Ubuntu binary that contains llama-gguf-split
+          GGUF=$(find ./downloaded -name '*.gguf' | head -n1)
+          CACT=$(find ./downloaded -name '*.cact' | head -n1)
+          if [ -z "$GGUF" ]; then echo "No GGUF found"; exit 1; fi
+          if [ -z "$CACT" ]; then echo "No .cact found"; exit 1; fi
+          echo "GGUF=$GGUF" >> $GITHUB_ENV
+          echo "CACT=$CACT" >> $GITHUB_ENV
+
+      - name: Get llama-gguf-split
+        run: |
           wget -q https://github.com/ggml-org/llama.cpp/releases/download/b7075/llama-b7075-bin-ubuntu-x64.zip
           unzip -q llama-b7075-bin-ubuntu-x64.zip -d llama-bin
-          # The splitter is inside the extracted folder; find it.
-          find llama-bin -name 'llama-gguf-split' -type f -exec chmod +x {} \;
           SPLITTER=$(find llama-bin -name 'llama-gguf-split' -type f | head -n1)
+          chmod +x "$SPLITTER"
           echo "SPLITTER=$SPLITTER" >> $GITHUB_ENV
 
-      - name: Split Nanbeige into 75 MB chunks
+      - name: Split into 75 MB chunks
         run: |
           mkdir -p models
-          $SPLITTER --split \
-            --split-max-size 75M \
-            ./downloaded/Nanbeige4.2-3B-Q2_K.gguf \
+          $SPLITTER --split --split-max-size 75M \
+            "$GGUF" \
             ./models/nanbeige-chunk
-          # Rename to predictable, fetch-friendly names
           cd models
           i=0
           for f in nanbeige-chunk-*.gguf; do
@@ -54,13 +62,13 @@ jobs:
           done
           ls -lh
 
-      - name: Copy Needle into models folder
-        run: cp ./downloaded/needle2.cact ./models/
+      - name: Copy Needle
+        run: cp "$CACT" ./models/needle2.cact
 
-      - name: Commit and push
+      - name: Commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add models/
-          git commit -m "Add split Nanbeige GGUF chunks + Needle 2 engine"
+          git commit -m "Add split Nanbeige chunks + Needle 2"
           git push
