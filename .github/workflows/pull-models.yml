@@ -6,69 +6,112 @@ on:
 permissions:
   contents: write
 
+env:
+  HF_REPO: tinyopsec/Nanbeige4.2-3B-GGUF
+  BASE_QUANT: Q2_K
+  EMBED_TYPE: IQ1_S
+  OUTPUT_TYPE: IQ1_S
+  SPLIT_SIZE: 200M
+
 jobs:
   pull-and-split:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install HF CLI
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install Hugging Face CLI
         run: pip install -q huggingface_hub
 
-      - name: Download Nanbeige Q2_K (any filename)
+      - name: Download Nanbeige base GGUF
         run: |
-          hf download tinyopsec/Nanbeige4.2-3B-GGUF \
-            --include "*Q2_K*" \
+          hf download "$HF_REPO" \
+            --include "*${BASE_QUANT}*" \
             --local-dir ./downloaded
-          echo "Downloaded Nanbeige files:"
+          echo "Downloaded:"
           find ./downloaded -name '*.gguf' -ls
 
-      - name: Download Needle 2 (any .cact)
+      - name: Download Needle 2
         run: |
           hf download Cactus-Compute/needle2 \
             --include "*.cact" \
             --local-dir ./downloaded
-          echo "Downloaded Needle files:"
+          echo "Downloaded Needle:"
           find ./downloaded -name '*.cact' -ls
 
-      - name: Resolve downloaded filenames
+      - name: Resolve downloaded files
         run: |
-          GGUF=$(find ./downloaded -name '*.gguf' | head -n1)
+          SRC=$(find ./downloaded -name '*Q2_K*.gguf' | head -n1)
+          if [ -z "$SRC" ]; then SRC=$(find ./downloaded -name '*.gguf' | head -n1); fi
           CACT=$(find ./downloaded -name '*.cact' | head -n1)
-          if [ -z "$GGUF" ]; then echo "No GGUF found"; exit 1; fi
+          if [ -z "$SRC" ]; then echo "No GGUF found"; exit 1; fi
           if [ -z "$CACT" ]; then echo "No .cact found"; exit 1; fi
-          echo "GGUF=$GGUF" >> $GITHUB_ENV
+          echo "SRC=$SRC" >> $GITHUB_ENV
           echo "CACT=$CACT" >> $GITHUB_ENV
+          echo "Using source: $SRC"
+          echo "Using needle: $CACT"
 
-      - name: Get llama-gguf-split
+      - name: Get llama.cpp binaries
         run: |
           wget -q https://github.com/ggml-org/llama.cpp/releases/download/b7075/llama-b7075-bin-ubuntu-x64.zip
           unzip -q llama-b7075-bin-ubuntu-x64.zip -d llama-bin
+          QUANT=$(find llama-bin -name 'llama-quantize' -type f | head -n1)
           SPLITTER=$(find llama-bin -name 'llama-gguf-split' -type f | head -n1)
-          chmod +x "$SPLITTER"
+          chmod +x "$QUANT" "$SPLITTER"
+          echo "QUANT=$QUANT" >> $GITHUB_ENV
           echo "SPLITTER=$SPLITTER" >> $GITHUB_ENV
 
-      - name: Split into 75 MB chunks
+      - name: Re-quantize with IQ1_S embedding
         run: |
           mkdir -p models
-          $SPLITTER --split --split-max-size 75M \
-            "$GGUF" \
-            ./models/nanbeige-chunk
+          $QUANT "$SRC" ./models/nanbeige-optimized.gguf "$BASE_QUANT" \
+            --token-embedding-type "$EMBED_TYPE" \
+            --output-tensor-type "$OUTPUT_TYPE"
+          ls -lh ./models/nanbeige-optimized.gguf
+
+      - name: Split into chunks
+        run: |
           cd models
+          $SPLITTER --split --split-max-size "$SPLIT_SIZE" \
+            nanbeige-optimized.gguf \
+            nanbeige-chunk
           i=0
           for f in nanbeige-chunk-*.gguf; do
             mv "$f" "nanbeige-part-$(printf '%03d' $i).gguf"
             i=$((i+1))
           done
+          rm -f nanbeige-optimized.gguf
+          echo "Chunk sizes:"
           ls -lh
+
+      - name: Verify max chunk under 100 MiB
+        run: |
+          MAX=$(find ./models -name 'nanbeige-part-*.gguf' -printf '%s\n' | sort -n | tail -n1)
+          MAX_MIB=$(echo "scale=2; $MAX / 1048576" | bc)
+          echo "Largest chunk: ${MAX_MIB} MiB"
+          if (( $(echo "$MAX_MIB > 100" | bc -l) )); then
+            echo "ERROR: largest chunk exceeds 100 MiB. Embedding tensor too large."
+            echo "You must switch to vocab trimming (Option B) to solve this."
+            exit 1
+          fi
+          echo "All chunks under 100 MiB. Safe to commit."
 
       - name: Copy Needle
         run: cp "$CACT" ./models/needle2.cact
 
-      - name: Commit
+      - name: Commit chunks
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add models/
-          git commit -m "Add split Nanbeige chunks + Needle 2"
+          git commit -m "Add optimized Nanbeige chunks (embedding=${EMBED_TYPE}, split=${SPLIT_SIZE})"
           git push
