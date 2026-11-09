@@ -1,4 +1,4 @@
-name: Pull & Split Models
+name: Pull & Optimize Models
 
 on:
   workflow_dispatch:
@@ -9,13 +9,15 @@ permissions:
 env:
   HF_REPO: tinyopsec/Nanbeige4.2-3B-GGUF
   IMAT_REPO: mradermacher/Nanbeige4.2-3B-Base-i1-GGUF
+  BF16_MODEL: Nanbeige/Nanbeige4.2-3B-Base
   BASE_QUANT: Q2_K
   EMBED_TYPE: IQ1_M
   OUTPUT_TYPE: IQ1_M
   SPLIT_SIZE: 200M
+  KEEP_TOKENS: 32000
 
 jobs:
-  pull-and-split:
+  optimize:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,100 +35,173 @@ jobs:
       - name: Install Hugging Face CLI
         run: pip install -q huggingface_hub
 
-      - name: Download Nanbeige base GGUF
-        run: |
-          hf download "$HF_REPO" \
-            --include "*${BASE_QUANT}*" \
-            --local-dir ./downloaded
-          echo "Downloaded:"
-          find ./downloaded -name '*.gguf' -ls
-
-      - name: Download Nanbeige imatrix
-        run: |
-          hf download "$IMAT_REPO" \
-            --include "*imatrix*" \
-            --local-dir ./imatrix
-          echo "Downloaded imatrix:"
-          find ./imatrix -type f -ls
-
-      - name: Download Needle 2
-        run: |
-          hf download Cactus-Compute/needle2 \
-            --include "*.cact" \
-            --local-dir ./downloaded
-          echo "Downloaded Needle:"
-          find ./downloaded -name '*.cact' -ls
-
-      - name: Resolve downloaded files
-        run: |
-          SRC=$(find ./downloaded -name '*Q2_K*.gguf' | head -n1)
-          if [ -z "$SRC" ]; then SRC=$(find ./downloaded -name '*.gguf' | head -n1); fi
-          CACT=$(find ./downloaded -name '*.cact' | head -n1)
-          IMAT=$(find ./imatrix -type f \( -name '*imatrix*' -o -name '*.dat' \) | head -n1)
-          if [ -z "$SRC" ]; then echo "No GGUF found"; exit 1; fi
-          if [ -z "$CACT" ]; then echo "No .cact found"; exit 1; fi
-          if [ -z "$IMAT" ]; then echo "No imatrix found"; exit 1; fi
-          echo "SRC=$SRC" >> $GITHUB_ENV
-          echo "CACT=$CACT" >> $GITHUB_ENV
-          echo "IMAT=$IMAT" >> $GITHUB_ENV
-          echo "Using source: $SRC"
-          echo "Using needle: $CACT"
-          echo "Using imatrix: $IMAT"
-
-      - name: Build llama.cpp from master (Nanbeige support)
+      - name: Build llama.cpp from master
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp
           cmake -B build -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j 4
+          echo "CONVERT=$PWD/convert_hf_to_gguf.py" >> $GITHUB_ENV
           echo "QUANT=$PWD/build/bin/llama-quantize" >> $GITHUB_ENV
           echo "SPLITTER=$PWD/build/bin/llama-gguf-split" >> $GITHUB_ENV
 
-      - name: Re-quantize with IQ1_M embedding (imatrix-compatible)
+      - name: Download Needle 2
         run: |
-          mkdir -p models
+          hf download Cactus-Compute/needle2 --include "*.cact" --local-dir ./downloaded
+          CACT=$(find ./downloaded -name '*.cact' | head -n1)
+          echo "CACT=$CACT" >> $GITHUB_ENV
+
+      # ============================================================
+      # PATH A: Per-tensor quantization on pre-quantized GGUF
+      # ============================================================
+      - name: Path A — Download base GGUF + imatrix
+        id: pathA
+        run: |
+          hf download "$HF_REPO" --include "*${BASE_QUANT}*" --local-dir ./downloaded
+          hf download "$IMAT_REPO" --include "*imatrix*" --local-dir ./imatrix
+          SRC=$(find ./downloaded -name '*Q2_K*.gguf' | head -n1)
+          IMAT=$(find ./imatrix -type f -name '*imatrix*' | head -n1)
+          if [ -z "$SRC" ] || [ -z "$IMAT" ]; then
+            echo "Path A prerequisites missing; skipping."
+            echo "pathA_ok=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "SRC=$SRC" >> $GITHUB_ENV
+          echo "IMAT=$IMAT" >> $GITHUB_ENV
+          echo "pathA_ok=true" >> $GITHUB_OUTPUT
+
+      - name: Path A — Re-quantize with IQ1_M embedding
+        if: steps.pathA.outputs.pathA_ok == 'true'
+        run: |
+          mkdir -p modelsA
           $QUANT \
             --allow-requantize \
             --imatrix "$IMAT" \
             --token-embedding-type "$EMBED_TYPE" \
             --output-tensor-type "$OUTPUT_TYPE" \
-            "$SRC" ./models/nanbeige-optimized.gguf "$BASE_QUANT"
-          ls -lh ./models/nanbeige-optimized.gguf
+            "$SRC" ./modelsA/nanbeige-optimized.gguf "$BASE_QUANT" || true
+          if [ -f ./modelsA/nanbeige-optimized.gguf ]; then
+            ls -lh ./modelsA/nanbeige-optimized.gguf
+          else
+            echo "Path A quantization failed; will fall through to Path B."
+          fi
 
-      - name: Split into chunks
+      - name: Path A — Split and verify
+        id: splitA
+        if: steps.pathA.outputs.pathA_ok == 'true'
         run: |
-          cd models
-          $SPLITTER --split --split-max-size "$SPLIT_SIZE" \
-            nanbeige-optimized.gguf \
-            nanbeige-chunk
+          if [ ! -f ./modelsA/nanbeige-optimized.gguf ]; then
+            echo "splitA_ok=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          cd modelsA
+          $SPLITTER --split --split-max-size "$SPLIT_SIZE" nanbeige-optimized.gguf nanbeige-chunk || true
+          i=0
+          for f in nanbeige-chunk-*.gguf; do
+            [ -e "$f" ] || continue
+            mv "$f" "nanbeige-part-$(printf '%03d' $i).gguf"
+            i=$((i+1))
+          done
+          rm -f nanbeige-optimized.gguf
+          MAX=$(find . -name 'nanbeige-part-*.gguf' -printf '%s\n' | sort -n | tail -n1)
+          if [ -z "$MAX" ]; then
+            echo "splitA_ok=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          MAX_MIB=$(echo "scale=2; $MAX / 1048576" | bc)
+          echo "Path A largest chunk: ${MAX_MIB} MiB"
+          if (( $(echo "$MAX_MIB > 100" | bc -l) )); then
+            echo "Path A exceeds 100 MiB; falling through to Path B."
+            echo "splitA_ok=false" >> $GITHUB_OUTPUT
+          else
+            echo "Path A succeeded."
+            echo "splitA_ok=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ============================================================
+      # PATH B: Vocab trim on BF16 HF model (only if Path A failed)
+      # ============================================================
+      - name: Path B — Set up Python
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Path B — Install Python deps
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        run: |
+          pip install -q --upgrade pip
+          pip install -q torch transformers accelerate safetensors sentencepiece
+
+      - name: Path B — Download BF16 HF model
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        run: |
+          hf download "$BF16_MODEL" --local-dir ./hf-original
+          ls -lh ./hf-original | head -n 20
+
+      - name: Path B — Trim vocabulary
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        run: |
+          python scripts/trim_nanbeige_vocab.py \
+            --model-dir ./hf-original \
+            --output-dir ./hf-trimmed \
+            --keep-tokens "$KEEP_TOKENS"
+          ls -lh ./hf-trimmed
+
+      - name: Path B — Convert to GGUF (FP16)
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        run: |
+          python $CONVERT ./hf-trimmed --outfile ./nanbeige-trimmed-f16.gguf --outtype f16
+          ls -lh ./nanbeige-trimmed-f16.gguf
+
+      - name: Path B — Quantize to Q2_K
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        run: |
+          mkdir -p modelsB
+          $QUANT ./nanbeige-trimmed-f16.gguf ./modelsB/nanbeige-trimmed-q2.gguf "$BASE_QUANT"
+          ls -lh ./modelsB/nanbeige-trimmed-q2.gguf
+
+      - name: Path B — Split and verify
+        if: steps.splitA.outputs.splitA_ok != 'true'
+        run: |
+          cd modelsB
+          $SPLITTER --split --split-max-size "$SPLIT_SIZE" nanbeige-trimmed-q2.gguf nanbeige-chunk
           i=0
           for f in nanbeige-chunk-*.gguf; do
             mv "$f" "nanbeige-part-$(printf '%03d' $i).gguf"
             i=$((i+1))
           done
-          rm -f nanbeige-optimized.gguf
-          echo "Chunk sizes:"
-          ls -lh
-
-      - name: Verify max chunk under 100 MiB
-        run: |
-          MAX=$(find ./models -name 'nanbeige-part-*.gguf' -printf '%s\n' | sort -n | tail -n1)
+          rm -f nanbeige-trimmed-q2.gguf
+          MAX=$(find . -name 'nanbeige-part-*.gguf' -printf '%s\n' | sort -n | tail -n1)
           MAX_MIB=$(echo "scale=2; $MAX / 1048576" | bc)
-          echo "Largest chunk: ${MAX_MIB} MiB"
+          echo "Path B largest chunk: ${MAX_MIB} MiB"
           if (( $(echo "$MAX_MIB > 100" | bc -l) )); then
-            echo "ERROR: largest chunk exceeds 100 MiB. Embedding tensor too large."
-            echo "You must switch to vocab trimming (Option B) to solve this."
+            echo "ERROR: Path B also exceeds 100 MiB."
             exit 1
           fi
-          echo "All chunks under 100 MiB. Safe to commit."
+          echo "Path B succeeded."
 
-      - name: Copy Needle
-        run: cp "$CACT" ./models/needle2.cact
+      # ============================================================
+      # FINAL: Stage the winning chunks, add Needle, commit
+      # ============================================================
+      - name: Stage final chunks
+        run: |
+          mkdir -p models
+          if [ -d ./modelsA ] && ls ./modelsA/nanbeige-part-*.gguf >/dev/null 2>&1; then
+            echo "Using Path A output."
+            mv ./modelsA/nanbeige-part-*.gguf ./models/
+          else
+            echo "Using Path B output."
+            mv ./modelsB/nanbeige-part-*.gguf ./models/
+          fi
+          cp "$CACT" ./models/needle2.cact
+          echo "Final models directory:"
+          ls -lh ./models
 
       - name: Commit chunks
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add models/
-          git commit -m "Add optimized Nanbeige chunks (embedding=${EMBED_TYPE}, split=${SPLIT_SIZE})"
+          git commit -m "Add optimized Nanbeige chunks + Needle 2"
           git push
