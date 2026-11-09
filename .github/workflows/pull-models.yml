@@ -73,9 +73,11 @@ jobs:
       - name: Re-quantize with IQ1_S embedding
         run: |
           mkdir -p models
-          $QUANT "$SRC" ./models/nanbeige-optimized.gguf "$BASE_QUANT" \
+          $QUANT \
+            --allow-requantize \
             --token-embedding-type "$EMBED_TYPE" \
-            --output-tensor-type "$OUTPUT_TYPE"
+            --output-tensor-type "$OUTPUT_TYPE" \
+            "$SRC" ./models/nanbeige-optimized.gguf "$BASE_QUANT"
           ls -lh ./models/nanbeige-optimized.gguf
 
       - name: Split into chunks
