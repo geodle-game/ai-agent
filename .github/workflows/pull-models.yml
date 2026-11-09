@@ -60,15 +60,14 @@ jobs:
           echo "Using source: $SRC"
           echo "Using needle: $CACT"
 
-      - name: Get llama.cpp binaries
+      - name: Build llama.cpp from master (Nanbeige support)
         run: |
-          wget -q https://github.com/ggml-org/llama.cpp/releases/download/b7075/llama-b7075-bin-ubuntu-x64.zip
-          unzip -q llama-b7075-bin-ubuntu-x64.zip -d llama-bin
-          QUANT=$(find llama-bin -name 'llama-quantize' -type f | head -n1)
-          SPLITTER=$(find llama-bin -name 'llama-gguf-split' -type f | head -n1)
-          chmod +x "$QUANT" "$SPLITTER"
-          echo "QUANT=$QUANT" >> $GITHUB_ENV
-          echo "SPLITTER=$SPLITTER" >> $GITHUB_ENV
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+          cd llama.cpp
+          cmake -B build -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 4
+          echo "QUANT=$PWD/build/bin/llama-quantize" >> $GITHUB_ENV
+          echo "SPLITTER=$PWD/build/bin/llama-gguf-split" >> $GITHUB_ENV
 
       - name: Re-quantize with IQ1_S embedding
         run: |
