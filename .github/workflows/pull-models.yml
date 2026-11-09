@@ -1,0 +1,66 @@
+name: Pull & Split Models
+
+on:
+  workflow_dispatch:   # manual trigger from the Actions tab
+
+permissions:
+  contents: write      # allows the job to commit chunks back to the repo
+
+jobs:
+  pull-and-split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Hugging Face CLI
+        run: pip install huggingface_hub
+
+      - name: Download Nanbeige4.2-3B GGUF
+        run: |
+          # Q2_K (1.76 GB) is the smallest listed quant.
+          # Swap to Q3_K_S (2.00 GB) if you want slightly better quality.
+          hf download tinyopsec/Nanbeige4.2-3B-GGUF \
+            Nanbeige4.2-3B-Q2_K.gguf \
+            --local-dir ./downloaded
+
+      - name: Download Needle 2
+        run: |
+          hf download Cactus-Compute/needle2 needle2.cact --local-dir ./downloaded
+
+      - name: Get llama.cpp splitter
+        run: |
+          # Pull a prebuilt Ubuntu binary that contains llama-gguf-split
+          wget -q https://github.com/ggml-org/llama.cpp/releases/download/b7075/llama-b7075-bin-ubuntu-x64.zip
+          unzip -q llama-b7075-bin-ubuntu-x64.zip -d llama-bin
+          # The splitter is inside the extracted folder; find it.
+          find llama-bin -name 'llama-gguf-split' -type f -exec chmod +x {} \;
+          SPLITTER=$(find llama-bin -name 'llama-gguf-split' -type f | head -n1)
+          echo "SPLITTER=$SPLITTER" >> $GITHUB_ENV
+
+      - name: Split Nanbeige into 75 MB chunks
+        run: |
+          mkdir -p models
+          $SPLITTER --split \
+            --split-max-size 75M \
+            ./downloaded/Nanbeige4.2-3B-Q2_K.gguf \
+            ./models/nanbeige-chunk
+          # Rename to predictable, fetch-friendly names
+          cd models
+          i=0
+          for f in nanbeige-chunk-*.gguf; do
+            mv "$f" "nanbeige-part-$(printf '%03d' $i).gguf"
+            i=$((i+1))
+          done
+          ls -lh
+
+      - name: Copy Needle into models folder
+        run: cp ./downloaded/needle2.cact ./models/
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/
+          git commit -m "Add split Nanbeige GGUF chunks + Needle 2 engine"
+          git push
