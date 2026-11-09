@@ -8,6 +8,7 @@ permissions:
 
 env:
   HF_REPO: tinyopsec/Nanbeige4.2-3B-GGUF
+  IMAT_REPO: mradermacher/Nanbeige4.2-3B-Base-i1-GGUF
   BASE_QUANT: Q2_K
   EMBED_TYPE: IQ1_S
   OUTPUT_TYPE: IQ1_S
@@ -40,6 +41,14 @@ jobs:
           echo "Downloaded:"
           find ./downloaded -name '*.gguf' -ls
 
+      - name: Download Nanbeige imatrix
+        run: |
+          hf download "$IMAT_REPO" \
+            --include "*imatrix*" \
+            --local-dir ./imatrix
+          echo "Downloaded imatrix:"
+          find ./imatrix -type f -ls
+
       - name: Download Needle 2
         run: |
           hf download Cactus-Compute/needle2 \
@@ -53,12 +62,16 @@ jobs:
           SRC=$(find ./downloaded -name '*Q2_K*.gguf' | head -n1)
           if [ -z "$SRC" ]; then SRC=$(find ./downloaded -name '*.gguf' | head -n1); fi
           CACT=$(find ./downloaded -name '*.cact' | head -n1)
+          IMAT=$(find ./imatrix -type f \( -name '*imatrix*' -o -name '*.dat' \) | head -n1)
           if [ -z "$SRC" ]; then echo "No GGUF found"; exit 1; fi
           if [ -z "$CACT" ]; then echo "No .cact found"; exit 1; fi
+          if [ -z "$IMAT" ]; then echo "No imatrix found"; exit 1; fi
           echo "SRC=$SRC" >> $GITHUB_ENV
           echo "CACT=$CACT" >> $GITHUB_ENV
+          echo "IMAT=$IMAT" >> $GITHUB_ENV
           echo "Using source: $SRC"
           echo "Using needle: $CACT"
+          echo "Using imatrix: $IMAT"
 
       - name: Build llama.cpp from master (Nanbeige support)
         run: |
@@ -69,11 +82,12 @@ jobs:
           echo "QUANT=$PWD/build/bin/llama-quantize" >> $GITHUB_ENV
           echo "SPLITTER=$PWD/build/bin/llama-gguf-split" >> $GITHUB_ENV
 
-      - name: Re-quantize with IQ1_S embedding
+      - name: Re-quantize with IQ1_S embedding (using imatrix)
         run: |
           mkdir -p models
           $QUANT \
             --allow-requantize \
+            --imatrix "$IMAT" \
             --token-embedding-type "$EMBED_TYPE" \
             --output-tensor-type "$OUTPUT_TYPE" \
             "$SRC" ./models/nanbeige-optimized.gguf "$BASE_QUANT"
