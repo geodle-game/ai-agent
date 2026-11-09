@@ -10,8 +10,8 @@ env:
   HF_REPO: tinyopsec/Nanbeige4.2-3B-GGUF
   IMAT_REPO: mradermacher/Nanbeige4.2-3B-Base-i1-GGUF
   BASE_QUANT: Q2_K
-  EMBED_TYPE: IQ1_S
-  OUTPUT_TYPE: IQ1_S
+  EMBED_TYPE: IQ1_M
+  OUTPUT_TYPE: IQ1_M
   SPLIT_SIZE: 200M
 
 jobs:
@@ -82,7 +82,7 @@ jobs:
           echo "QUANT=$PWD/build/bin/llama-quantize" >> $GITHUB_ENV
           echo "SPLITTER=$PWD/build/bin/llama-gguf-split" >> $GITHUB_ENV
 
-      - name: Re-quantize with IQ1_S embedding (using imatrix)
+      - name: Re-quantize with IQ1_M embedding (imatrix-compatible)
         run: |
           mkdir -p models
           $QUANT \
