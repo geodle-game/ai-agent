@@ -113,8 +113,8 @@ async function loadWllama(blob) {
   wllama = new Wllama(CONFIG_PATHS);
   log('wllama instantiated. Loading model from Blob…');
 
-  // FIX: method is loadModel(), not loadModelFromBlob()
-  await wllama.loadModel(blob, {
+  // FIX: loadModel() expects an array of Blobs
+  await wllama.loadModel([blob], {
     n_ctx: 2048,
     n_threads: 1,
     progressCallback: ({ loaded, total }) => {
