@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nanbeige Agent — Loader</title>
+  <title>Agent Loader — Test</title>
   <style>
     body { font-family: -apple-system, sans-serif; padding: 16px; max-width: 720px; margin: 0 auto; }
     button, input { font-size: 16px; padding: 10px; margin: 6px 0; width: 100%; box-sizing: border-box; }
@@ -15,7 +15,7 @@
   </style>
 </head>
 <body>
-  <h2>Nanbeige Loader</h2>
+  <h2>Agent Loader — Test</h2>
   <label>Manifest URL</label>
   <input id="manifestUrl"
     value="https://raw.githubusercontent.com/geodle-game/ai-agent/main/models/manifest.json">
@@ -98,20 +98,13 @@ async function assemble(parts, manifest) {
     throw new Error(`size mismatch: got ${blob.size}, expected ${manifest.total_size_bytes}`);
   }
 
-  // Verify GGUF magic number (first 4 bytes)
   const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
   const magic = String.fromCharCode(...header);
-  const hex = Array.from(header).map(b => b.toString(16).padStart(2, '0')).join(' ');
-  log(`Header bytes: "${magic}" (hex: ${hex})`);
+  log(`Header bytes: "${magic}"`);
 
   if (magic !== 'GGUF') {
     throw new Error(`Invalid magic number: expected "GGUF", got "${magic}". Chunks are out of order or corrupted.`);
   }
-
-  // Also check GGUF version (bytes 4-7, little-endian uint32)
-  const verBuf = new Uint8Array(await blob.slice(4, 8).arrayBuffer());
-  const version = new DataView(verBuf.buffer).getUint32(0, true);
-  log(`GGUF version: ${version}`);
 
   log('Size and header verified.', 'ok');
   return blob;
