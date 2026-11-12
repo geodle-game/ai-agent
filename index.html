@@ -3,27 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent Loader — Test</title>
+  <title>Nanbeige ONNX — Transformers.js</title>
   <style>
     body { font-family: -apple-system, sans-serif; padding: 16px; max-width: 720px; margin: 0 auto; }
     button, input { font-size: 16px; padding: 10px; margin: 6px 0; width: 100%; box-sizing: border-box; }
     #log { background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:12px;
            height:320px; overflow-y:auto; white-space:pre-wrap; border-radius:8px; }
-    #bar { height:10px; background:#333; border-radius:5px; overflow:hidden; margin:8px 0; }
-    #fill { height:100%; width:0%; background:#0f0; transition:width .2s; }
     .ok{color:#0f0} .err{color:#f55} .warn{color:#ff0}
+    #status { padding: 10px; background: #222; color: #fff; border-radius: 8px; margin: 8px 0; }
   </style>
 </head>
 <body>
-  <h2>Agent Loader — Test</h2>
-  <label>Manifest URL</label>
-  <input id="manifestUrl"
-    value="https://raw.githubusercontent.com/geodle-game/ai-agent/main/models/manifest.json">
-  <label>Base URL for chunks</label>
-  <input id="baseUrl"
-    value="https://raw.githubusercontent.com/geodle-game/ai-agent/main/models/">
-  <button id="loadBtn">Download & Load Model</button>
-  <div id="bar"><div id="fill"></div></div>
+  <h2>Nanbeige ONNX Loader</h2>
+  <p>Loads via Transformers.js + ONNX Runtime Web. No wllama, no chunking.</p>
+  <button id="loadBtn">Load Model</button>
+  <div id="status">Idle</div>
   <input id="prompt" placeholder="Say hi in 5 words" value="Say hi in 5 words" disabled>
   <button id="genBtn" disabled>Generate</button>
   <div id="log"></div>
@@ -36,142 +30,93 @@ function log(msg, cls='') {
   logEl.scrollTop = logEl.scrollHeight;
   console.log(msg);
 }
-function setProgress(pct) { $('fill').style.width = pct.toFixed(1) + '%'; }
-
-let wllama = null;
-
-async function fetchManifest(url) {
-  log(`Fetching manifest: ${url}`);
-  const res = await fetch(url, { cache: 'no-cache' });
-  if (!res.ok) throw new Error(`manifest HTTP ${res.status}`);
-  const m = await res.json();
-  log(`Manifest OK: ${m.num_chunks} chunks, ${(m.total_size_bytes/1048576).toFixed(1)} MB total`, 'ok');
-  return m;
+function setStatus(msg, cls='') {
+  $('status').textContent = msg;
+  $('status').className = cls;
 }
 
-async function fetchChunk(url, retries = 2) {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength === 0) throw new Error('empty chunk');
-      return buf;
-    } catch (e) {
-      if (i === retries) throw e;
-      log(`  retry ${i+1} for ${url.split('/').pop()}: ${e.message}`, 'warn');
-      await new Promise(r => setTimeout(r, 500 * (i + 1)));
-    }
-  }
-}
+let pipe = null;
 
-async function fetchAllChunks(manifest, baseUrl) {
-  const parts = new Array(manifest.num_chunks);
-  const total = manifest.num_chunks;
-  let done = 0, bytes = 0, next = 0;
-  const CONCURRENCY = 3;
-
-  async function worker() {
-    while (true) {
-      const idx = next++;
-      if (idx >= total) return;
-      const name = manifest.chunks[idx];
-      const buf = await fetchChunk(baseUrl + name);
-      parts[idx] = buf;
-      done++; bytes += buf.byteLength;
-      setProgress((bytes / manifest.total_size_bytes) * 100);
-      if (done % 5 === 0 || done === total) {
-        log(`  ${done}/${total} chunks, ${(bytes/1048576).toFixed(1)} MB`);
-      }
-    }
-  }
-
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  return parts;
-}
-
-async function assemble(parts, manifest) {
-  log('Assembling Blob…');
-  const blob = new Blob(parts, { type: 'application/octet-stream' });
-  log(`Assembled size: ${blob.size} bytes (expected ${manifest.total_size_bytes})`);
-  if (blob.size !== manifest.total_size_bytes) {
-    throw new Error(`size mismatch: got ${blob.size}, expected ${manifest.total_size_bytes}`);
-  }
-
-  const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-  const magic = String.fromCharCode(...header);
-  log(`Header bytes: "${magic}"`);
-
-  if (magic !== 'GGUF') {
-    throw new Error(`Invalid magic number: expected "GGUF", got "${magic}". Chunks are out of order or corrupted.`);
-  }
-
-  log('Size and header verified.', 'ok');
-  return blob;
-}
-
-async function loadWllama(blob) {
-  log('Importing wllama…');
-  const { Wllama } = await import('https://cdn.jsdelivr.net/npm/@wllama/wllama@2.3.1/esm/index.js');
-
-  const CONFIG_PATHS = {
-    'single-thread/wllama.wasm':
-      'https://cdn.jsdelivr.net/npm/@wllama/wllama@2.3.1/src/single-thread/wllama.wasm',
-  };
-
-  wllama = new Wllama(CONFIG_PATHS);
-  log('wllama instantiated. Loading model from Blob…');
-
-  await wllama.loadModel([blob], {
-    n_ctx: 2048,
-    n_threads: 1,
-    progressCallback: ({ loaded, total }) => {
-      const pct = (loaded / total) * 100;
-      if (Math.round(pct) % 10 === 0) log(`  model load: ${pct.toFixed(0)}%`);
-    },
-  });
-
-  log('MODEL LOADED', 'ok');
-}
-
-async function generate() {
-  const prompt = $('prompt').value;
-  log(`Prompt: "${prompt}"`);
-  try {
-    const t0 = performance.now();
-    let n = 0;
-    const out = await wllama.createCompletion(prompt, {
-      nPredict: 64,
-      sampling: { temp: 0.7 },
-      onNewToken: () => { n++; },
-    });
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    log(`OUTPUT: ${out}`, 'ok');
-    log(`Done: ${n} tokens in ${dt}s = ${(n/dt).toFixed(1)} tok/s`, 'ok');
-  } catch (e) {
-    log(`GENERATION FAILED: ${e.message}`, 'err');
-  }
-}
-
+// ------------------------------------------------------------
+// Load via Transformers.js
+// ------------------------------------------------------------
 $('loadBtn').onclick = async () => {
   $('loadBtn').disabled = true;
+  setStatus('Loading Transformers.js…', 'warn');
+
   try {
-    const manifest = await fetchManifest($('manifestUrl').value.trim());
-    const parts = await fetchAllChunks(manifest, $('baseUrl').value.trim());
-    const blob = await assemble(parts, manifest);
-    await loadWllama(blob);
+    // Import Transformers.js from CDN (no build step)
+    const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0');
+
+    // Optional: use WebGPU if available for speed
+    // Safari iOS WebGPU support is limited, so we default to WASM.
+    const hasWebGPU = !!navigator.gpu;
+    log(`WebGPU available: ${hasWebGPU}`);
+
+    setStatus('Loading Nanbeige ONNX model… (this may take several minutes)');
+    log('Loading model from Hugging Face: nicolasembleton/Nanbeige4.2-3B-ONNX');
+
+    // This triggers the download of the ONNX graph + external data shards.
+    // Transformers.js handles caching via the browser Cache API.
+    pipe = await pipeline(
+      'text-generation',
+      'nicolasembleton/Nanbeige4.2-3B-ONNX',
+      {
+        dtype: 'q4',          // use quantized weights if available; fallback to fp16
+        device: hasWebGPU ? 'webgpu' : 'wasm',
+        progress_callback: (p) => {
+          if (p.status === 'progress') {
+            const pct = p.progress ? p.progress.toFixed(1) : '?';
+            log(`  ${p.file}: ${pct}%`);
+          } else if (p.status === 'done') {
+            log(`  done: ${p.file}`, 'ok');
+          }
+        },
+      }
+    );
+
+    log('MODEL LOADED', 'ok');
+    setStatus('Model loaded. Ready to generate.', 'ok');
     $('prompt').disabled = false;
     $('genBtn').disabled = false;
     $('genBtn').onclick = generate;
-    log('Ready. Tap Generate.', 'ok');
+
   } catch (e) {
     log(`LOAD FAILED: ${e.message}`, 'err');
     console.error(e);
+    setStatus('Load failed: ' + e.message, 'err');
     $('loadBtn').disabled = false;
   }
 };
 
-log('Page ready. Tap "Download & Load Model".');
+// ------------------------------------------------------------
+// Generate
+// ------------------------------------------------------------
+async function generate() {
+  const prompt = $('prompt').value;
+  log(`Prompt: "${prompt}"`);
+  setStatus('Generating…', 'warn');
+
+  try {
+    const t0 = performance.now();
+    const output = await pipe(prompt, {
+      max_new_tokens: 64,
+      temperature: 0.7,
+      do_sample: true,
+    });
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+
+    const text = output[0].generated_text;
+    log(`OUTPUT: ${text}`, 'ok');
+    setStatus(`Generated in ${dt}s`, 'ok');
+
+  } catch (e) {
+    log(`GENERATION FAILED: ${e.message}`, 'err');
+    setStatus('Generation failed', 'err');
+  }
+}
+
+log('Page ready. Tap "Load Model".');
 </script>
 </body>
 </html>
