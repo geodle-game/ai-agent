@@ -1,0 +1,90 @@
+name: Pull & Split Models
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  HF_REPO: tinyopsec/Nanbeige4.2-3B-GGUF
+  BASE_QUANT: Q2_K
+  CHUNK_SIZE: 50M
+
+jobs:
+  pull-and-split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install Hugging Face CLI
+        run: pip install -q huggingface_hub
+
+      - name: Download Nanbeige GGUF
+        run: |
+          hf download "$HF_REPO" --include "*${BASE_QUANT}*" --local-dir ./downloaded
+          find ./downloaded -name '*.gguf' -ls
+
+      - name: Download Needle 2
+        run: |
+          hf download Cactus-Compute/needle2 --include "*.cact" --local-dir ./downloaded
+          find ./downloaded -name '*.cact' -ls
+
+      - name: Resolve files
+        run: |
+          SRC=$(find ./downloaded -name '*Q2_K*.gguf' | head -n1)
+          [ -z "$SRC" ] && SRC=$(find ./downloaded -name '*.gguf' | head -n1)
+          CACT=$(find ./downloaded -name '*.cact' | head -n1)
+          [ -z "$SRC" ] && { echo "No GGUF found"; exit 1; }
+          [ -z "$CACT" ] && { echo "No .cact found"; exit 1; }
+          echo "SRC=$SRC" >> $GITHUB_ENV
+          echo "CACT=$CACT" >> $GITHUB_ENV
+          echo "Source: $SRC"
+          echo "Needle: $CACT"
+
+      - name: Split into byte chunks
+        run: |
+          mkdir -p models
+          ORIG_SIZE=$(stat -c%s "$SRC")
+          echo "Original size: $ORIG_SIZE bytes"
+          split -b "$CHUNK_SIZE" -d --suffix-length=3 "$SRC" ./models/nanbeige-part-
+          cd models
+          for f in nanbeige-part-*; do mv "$f" "${f}.gguf"; done
+          echo "Chunk count: $(ls nanbeige-part-*.gguf | wc -l)"
+          ls -lh | head -n 10
+          echo "ORIG_SIZE=$ORIG_SIZE" >> $GITHUB_ENV
+
+      - name: Copy Needle
+        run: cp "$CACT" ./models/needle2.cact
+
+      - name: Generate manifest
+        run: python3 scripts/generate_manifest.py
+
+      - name: Verify no file exceeds 100 MiB
+        run: |
+          MAX=$(find ./models -type f -printf '%s\n' | sort -n | tail -n1)
+          MAX_MIB=$(echo "scale=2; $MAX / 1048576" | bc)
+          echo "Largest file: ${MAX_MIB} MiB"
+          if (( $(echo "$MAX_MIB > 100" | bc -l) )); then
+            echo "ERROR: file exceeds 100 MiB"
+            exit 1
+          fi
+          echo "All files under 100 MiB."
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/
+          git commit -m "Add byte-split Nanbeige chunks + manifest + Needle 2" || echo "Nothing to commit"
+          git push
