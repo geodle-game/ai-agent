@@ -90,14 +90,30 @@ async function fetchAllChunks(manifest, baseUrl) {
   return parts;
 }
 
-function assemble(parts, manifest) {
-  log('Assembling Blob (lazy — no full copy)…');
+async function assemble(parts, manifest) {
+  log('Assembling Blob…');
   const blob = new Blob(parts, { type: 'application/octet-stream' });
   log(`Assembled size: ${blob.size} bytes (expected ${manifest.total_size_bytes})`);
   if (blob.size !== manifest.total_size_bytes) {
     throw new Error(`size mismatch: got ${blob.size}, expected ${manifest.total_size_bytes}`);
   }
-  log('Size verified.', 'ok');
+
+  // Verify GGUF magic number (first 4 bytes)
+  const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+  const magic = String.fromCharCode(...header);
+  const hex = Array.from(header).map(b => b.toString(16).padStart(2, '0')).join(' ');
+  log(`Header bytes: "${magic}" (hex: ${hex})`);
+
+  if (magic !== 'GGUF') {
+    throw new Error(`Invalid magic number: expected "GGUF", got "${magic}". Chunks are out of order or corrupted.`);
+  }
+
+  // Also check GGUF version (bytes 4-7, little-endian uint32)
+  const verBuf = new Uint8Array(await blob.slice(4, 8).arrayBuffer());
+  const version = new DataView(verBuf.buffer).getUint32(0, true);
+  log(`GGUF version: ${version}`);
+
+  log('Size and header verified.', 'ok');
   return blob;
 }
 
@@ -113,7 +129,6 @@ async function loadWllama(blob) {
   wllama = new Wllama(CONFIG_PATHS);
   log('wllama instantiated. Loading model from Blob…');
 
-  // FIX: loadModel() expects an array of Blobs
   await wllama.loadModel([blob], {
     n_ctx: 2048,
     n_threads: 1,
@@ -150,7 +165,7 @@ $('loadBtn').onclick = async () => {
   try {
     const manifest = await fetchManifest($('manifestUrl').value.trim());
     const parts = await fetchAllChunks(manifest, $('baseUrl').value.trim());
-    const blob = assemble(parts, manifest);
+    const blob = await assemble(parts, manifest);
     await loadWllama(blob);
     $('prompt').disabled = false;
     $('genBtn').disabled = false;
