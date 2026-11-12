@@ -1,0 +1,51 @@
+name: Build Wllama WASM (Nanbeige)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout wllama fork
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Point this to YOUR fork where llama.cpp submodule is at b10153+
+          repository: geodle-game/wllama-nanbeige
+
+      - name: Pin llama.cpp to b10153 (Nanbeige support)
+        run: |
+          cd llama.cpp
+          git fetch --tags
+          git checkout b10153
+          cd ..
+          echo "llama.cpp version:"
+          cd llama.cpp && git log -1 --oneline
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.55
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build WASM (single-thread)
+        run: |
+          mkdir -p wasm/single-thread
+          cd wasm/single-thread
+          export SHARED_EMCC_CFLAGS="--no-entry -O3 -msimd128 -fno-rtti -DNDEBUG -flto=full -fwasm-exceptions -sEXPORT_ALL=1 -sEXPORT_ES6=1 -sMODULARIZE=1 -sINITIAL_MEMORY=128MB -sMAXIMUM_MEMORY=4096MB -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXPORTED_FUNCTIONS=_main,_wllama_start,_wllama_action,_wllama_exit,_wllama_debug -sEXPORTED_RUNTIME_METHODS=ccall,cwrap -sNO_EXIT_RUNTIME=1"
+          emcmake cmake ../..
+          EMCC_CFLAGS="$SHARED_EMCC_CFLAGS" emmake make wllama -j$(nproc)
+          cd ../..
+          cp wasm/single-thread/wllama.js src/single-thread/
+          cp wasm/single-thread/wllama.wasm src/single-thread/
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wllama-nanbeige-wasm
+          path: |
+            src/single-thread/wllama.js
+            src/single-thread/wllama.wasm
