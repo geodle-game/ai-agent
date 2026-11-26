@@ -1,7 +1,7 @@
 name: Run Nanbeige Model
 
 on:
-  workflow_dispatch:        # manual trigger from the Actions tab
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -26,27 +26,32 @@ jobs:
 
       - name: Download prebuilt llama.cpp binaries (CPU, Ubuntu x64)
         run: |
-          # Make sure jq is available (it usually is on ubuntu-latest)
           if ! command -v jq &> /dev/null; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
-          # Ask the GitHub API for the latest release and grab the Ubuntu x64 tarball
-          ASSET_URL=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
-            | jq -r '.assets[] | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$")) | .browser_download_url')
+          echo "Searching for a release that contains the Ubuntu x64 CPU tarball..."
+          # Get the last 30 releases, find the first one with the right asset
+          ASSET_URL=$(curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30" \
+            | jq -r '
+                .[] 
+                | select(.assets | any(.name | test("bin-ubuntu-x64\\.tar\\.gz$"))) 
+                | .assets[] 
+                | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$")) 
+                | .browser_download_url
+              ' | head -n 1)
 
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "ERROR: Could not find a matching Ubuntu x64 tarball in the latest release."
-            echo "Available assets:"
-            curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
-              | jq -r '.assets[].name'
+            echo "ERROR: Could not find any release containing bin-ubuntu-x64.tar.gz."
+            echo "Listing assets from the most recent 5 releases for debugging:"
+            curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5" \
+              | jq -r '.[] | "\(.tag_name): \(.assets[].name // "no assets")"'
             exit 1
           fi
 
-          echo "Downloading: $ASSET_URL"
+          echo "Found asset: $ASSET_URL"
           curl -L -o llama.tar.gz "$ASSET_URL"
 
-          # Extract the tarball
           mkdir -p llama
           tar -xzf llama.tar.gz -C llama
 
@@ -55,7 +60,6 @@ jobs:
 
       - name: Run inference with llama-cli
         run: |
-          # Locate llama-cli dynamically (path varies slightly between builds)
           LLAMA_CLI=$(find llama -type f -name "llama-cli" | head -n 1)
           if [ -z "$LLAMA_CLI" ]; then
             echo "ERROR: llama-cli binary not found after extraction."
@@ -65,10 +69,8 @@ jobs:
           echo "Using: $LLAMA_CLI"
           chmod +x "$LLAMA_CLI"
 
-          # Quick sanity check
           "$LLAMA_CLI" --version || true
 
-          # Run the model
           "$LLAMA_CLI" \
             -m models/nanbeige-reassembled.gguf \
             -p "Explain in one sentence what this repository does and why the model is stored as byte-split chunks." \
