@@ -1,32 +1,78 @@
 name: Run Nanbeige Model
+
 on:
-  workflow_dispatch:   # lets you trigger it manually
+  workflow_dispatch:        # manual trigger from the Actions tab
   push:
     branches: [main]
 
 jobs:
   run-model:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Reassemble GGUF chunks from manifest
-        run: python3 scripts/assemble_model.py
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Download prebuilt llama.cpp binaries
+      - name: Reassemble GGUF chunks from manifest
         run: |
-          curl -L -o llama.zip \
-            https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-b6000-bin-ubuntu-x64.zip
-          unzip -q llama.zip -d llama
-          # The binary is typically in llama/build/bin/
-          ls -lh llama/build/bin/
+          python3 scripts/assemble_model.py
+          ls -lh models/
+
+      - name: Download prebuilt llama.cpp binaries (CPU, Ubuntu x64)
+        run: |
+          # Make sure jq is available (it usually is on ubuntu-latest)
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+          # Ask the GitHub API for the latest release and grab the Ubuntu x64 tarball
+          ASSET_URL=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+            | jq -r '.assets[] | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$")) | .browser_download_url')
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "ERROR: Could not find a matching Ubuntu x64 tarball in the latest release."
+            echo "Available assets:"
+            curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+              | jq -r '.assets[].name'
+            exit 1
+          fi
+
+          echo "Downloading: $ASSET_URL"
+          curl -L -o llama.tar.gz "$ASSET_URL"
+
+          # Extract the tarball
+          mkdir -p llama
+          tar -xzf llama.tar.gz -C llama
+
+          echo "--- Binaries found: ---"
+          find llama -type f -name "llama-*" -executable | head -20
 
       - name: Run inference with llama-cli
         run: |
-          ./llama/build/bin/llama-cli \
+          # Locate llama-cli dynamically (path varies slightly between builds)
+          LLAMA_CLI=$(find llama -type f -name "llama-cli" | head -n 1)
+          if [ -z "$LLAMA_CLI" ]; then
+            echo "ERROR: llama-cli binary not found after extraction."
+            find llama -maxdepth 3 -type f | head -30
+            exit 1
+          fi
+          echo "Using: $LLAMA_CLI"
+          chmod +x "$LLAMA_CLI"
+
+          # Quick sanity check
+          "$LLAMA_CLI" --version || true
+
+          # Run the model
+          "$LLAMA_CLI" \
             -m models/nanbeige-reassembled.gguf \
-            -p "Explain what this repository does in one sentence." \
+            -p "Explain in one sentence what this repository does and why the model is stored as byte-split chunks." \
             -n 128 \
             --threads 4 \
+            --temp 0.7 \
             --no-display-prompt
