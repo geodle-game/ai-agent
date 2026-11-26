@@ -58,23 +58,22 @@ jobs:
           echo "--- Binaries found: ---"
           find llama -type f -name "llama-*" -executable | head -20
 
-      - name: Run inference with llama-cli
+            - name: Run inference with llama-cli
         run: |
           LLAMA_CLI=$(find llama -type f -name "llama-cli" | head -n 1)
-          if [ -z "$LLAMA_CLI" ]; then
-            echo "ERROR: llama-cli binary not found after extraction."
-            find llama -maxdepth 3 -type f | head -30
-            exit 1
-          fi
-          echo "Using: $LLAMA_CLI"
           chmod +x "$LLAMA_CLI"
-
-          "$LLAMA_CLI" --version || true
 
           "$LLAMA_CLI" \
             -m models/nanbeige-reassembled.gguf \
-            -p "Explain in one sentence what this repository does and why the model is stored as byte-split chunks." \
-            -n 128 \
+            -p "$PROMPT" \
+            -n -1 \
+            -c 8192 \
             --threads 4 \
             --temp 0.7 \
-            --no-display-prompt
+            --no-display-prompt \
+            --no-warmup \
+            -no-cnv \
+            2>&1 | tee model_output.txt
+
+          echo "=== MODEL OUTPUT ==="
+          cat model_output.txt
