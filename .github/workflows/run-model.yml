@@ -1,12 +1,20 @@
-name: Run Nanbeige Model
+
+name: Talk to AI
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      prompt:
+        description: "Your message to Nanbeige"
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   run-model:
+    name: Run Nanbeige inference
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -17,52 +25,94 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Reassemble GGUF chunks from manifest
+      - name: Validate prompt
+        env:
+          PROMPT: ${{ inputs.prompt }}
         run: |
-          python3 scripts/assemble_model.py
-          ls -lh models/
+          set -euo pipefail
 
-      - name: Download prebuilt llama.cpp binaries (CPU, Ubuntu x64)
-        run: |
-          if ! command -v jq &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y jq
-          fi
-
-          echo "Searching for a release that contains the Ubuntu x64 CPU tarball..."
-          # Get the last 30 releases, find the first one with the right asset
-          ASSET_URL=$(curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30" \
-            | jq -r '
-                .[] 
-                | select(.assets | any(.name | test("bin-ubuntu-x64\\.tar\\.gz$"))) 
-                | .assets[] 
-                | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$")) 
-                | .browser_download_url
-              ' | head -n 1)
-
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "ERROR: Could not find any release containing bin-ubuntu-x64.tar.gz."
-            echo "Listing assets from the most recent 5 releases for debugging:"
-            curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5" \
-              | jq -r '.[] | "\(.tag_name): \(.assets[].name // "no assets")"'
+          if [ -z "${PROMPT//[[:space:]]/}" ]; then
+            echo "Error: Prompt cannot be empty."
             exit 1
           fi
 
-          echo "Found asset: $ASSET_URL"
-          curl -L -o llama.tar.gz "$ASSET_URL"
+          echo "Prompt received successfully."
+          echo "Prompt length: ${#PROMPT} characters"
+
+      - name: Reassemble GGUF chunks
+        run: |
+          set -euo pipefail
+
+          python3 scripts/assemble_model.py
+
+          test -s models/nanbeige-reassembled.gguf
+          ls -lh models/nanbeige-reassembled.gguf
+
+      - name: Download llama.cpp binaries
+        run: |
+          set -euo pipefail
+
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+          echo "Searching for Ubuntu x64 CPU binaries..."
+
+          ASSET_URL=$(
+            curl -fsSL \
+              "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30" \
+            | jq -r '
+                .[]
+                | select(.assets | any(.name | test("bin-ubuntu-x64\\.tar\\.gz$")))
+                | .assets[]
+                | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$"))
+                | .browser_download_url
+              ' \
+            | head -n 1
+          )
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "Could not find the Ubuntu x64 CPU release."
+            exit 1
+          fi
+
+          echo "Downloading: $ASSET_URL"
+
+          curl -fL "$ASSET_URL" -o llama.tar.gz
 
           mkdir -p llama
           tar -xzf llama.tar.gz -C llama
 
-          echo "--- Binaries found: ---"
-          find llama -type f -name "llama-*" -executable | head -20
+          LLAMA_CLI=$(find llama -type f -name "llama-cli" -print -quit)
 
+          if [ -z "$LLAMA_CLI" ]; then
+            echo "llama-cli was not found in the downloaded archive."
+            exit 1
+          fi
 
-      - name: Run inference with llama-cli
-        run: |
-          LLAMA_CLI=$(find llama -type f -name "llama-cli" | head -n 1)
           chmod +x "$LLAMA_CLI"
+
+          echo "llama-cli found: $LLAMA_CLI"
+
+      - name: Run Nanbeige inference
+        env:
+          PROMPT: ${{ inputs.prompt }}
+        run: |
+          set -euo pipefail
+
+          LLAMA_CLI=$(find llama -type f -name "llama-cli" -print -quit)
+
+          if [ -z "$LLAMA_CLI" ]; then
+            echo "llama-cli is missing."
+            exit 1
+          fi
+
+          mkdir -p output
+
+          echo "Starting inference..."
 
           "$LLAMA_CLI" \
             -m models/nanbeige-reassembled.gguf \
@@ -74,7 +124,81 @@ jobs:
             --no-display-prompt \
             --no-warmup \
             -no-cnv \
-            2>&1 | tee model_output.txt
+            > output/model_output.txt \
+            2> output/llama_stderr.log
 
-          echo "=== MODEL OUTPUT ==="
-          cat model_output.txt
+          if [ ! -s output/model_output.txt ]; then
+            echo "Inference completed without producing a response."
+            cat output/llama_stderr.log
+            exit 1
+          fi
+
+          echo "Inference completed."
+          echo "Response size: $(wc -c < output/model_output.txt) bytes"
+
+      - name: Create response document
+        if: always()
+        env:
+          PROMPT: ${{ inputs.prompt }}
+        run: |
+          mkdir -p output
+
+          {
+            printf '# Nanbeige Response\n\n'
+            printf '**Run ID:** %s\n\n' "$GITHUB_RUN_ID"
+            printf '## Prompt\n\n'
+            printf '%s\n' "$PROMPT"
+            printf '\n## Response\n\n'
+
+            if [ -s output/model_output.txt ]; then
+              cat output/model_output.txt
+            else
+              echo "No response was generated."
+            fi
+          } > output/response.md
+
+      - name: Display response in Actions summary
+        if: always()
+        env:
+          PROMPT: ${{ inputs.prompt }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "# Nanbeige AI"
+            echo ""
+            echo "**Status:** $JOB_STATUS"
+            echo ""
+            echo "## Your prompt"
+            echo ""
+            printf '%s\n' "$PROMPT"
+            echo ""
+            echo "## Response"
+            echo ""
+
+            if [ -s output/model_output.txt ]; then
+              cat output/model_output.txt
+            else
+              echo "No response was generated."
+            fi
+
+            if [ "$JOB_STATUS" != "success" ] && [ -s output/llama_stderr.log ]; then
+              echo ""
+              echo "## Diagnostic output"
+              echo ""
+              echo '```text'
+              tail -n 80 output/llama_stderr.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload response and diagnostic files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanbeige-response-${{ github.run_id }}
+          path: |
+            output/response.md
+            output/model_output.txt
+            output/llama_stderr.log
+          if-no-files-found: warn
+          retention-days: 7
