@@ -58,7 +58,8 @@ jobs:
           echo "--- Binaries found: ---"
           find llama -type f -name "llama-*" -executable | head -20
 
-            - name: Run inference with llama-cli
+
+      - name: Run inference with llama-cli
         run: |
           LLAMA_CLI=$(find llama -type f -name "llama-cli" | head -n 1)
           chmod +x "$LLAMA_CLI"
