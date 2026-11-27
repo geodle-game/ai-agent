@@ -95,10 +95,12 @@ jobs:
             exit 1
           fi
           chmod +x "$LLAMA_CLI"
-
           mkdir -p output
-          set +e
-          "$LLAMA_CLI" \
+
+          # Conversation mode (chat template applied) + /exit via stdin.
+          # No -no-cnv anywhere: it disables the chat template and recent
+          # llama.cpp builds don't accept the single-dash form.
+          printf '/exit\n' | "$LLAMA_CLI" \
             -m models/nanbeige-reassembled.gguf \
             -p "$PROMPT" \
             -n -1 \
@@ -107,17 +109,42 @@ jobs:
             --temp 0.7 \
             --no-display-prompt \
             --no-warmup \
-            -no-cnv \
             > output/model_output.txt 2> output/llama_stderr.log
-          EXIT_CODE=$?
-          set -e
 
-          echo "llama-cli exit code: $EXIT_CODE"
-          echo "=== MODEL OUTPUT ==="
-          cat output/model_output.txt
+          echo "=== STDOUT size: $(stat -c%s output/model_output.txt) bytes ==="
+          echo "=== STDERR size: $(stat -c%s output/llama_stderr.log) bytes ==="
+          echo ""
+          echo "=== STDOUT preview ==="
+          head -c 2000 output/model_output.txt || true
+          echo ""
+          echo "=== STDERR tail ==="
+          tail -c 1000 output/llama_stderr.log || true
+          echo ""
 
-          # Strip <think>...</think> blocks for clean display
-          sed -E 's/<think>.*<\/think>//g' output/model_output.txt > output/clean_output.txt || cp output/model_output.txt output/clean_output.txt
+          # Fallback: some builds write generated tokens to stderr.
+          if [ ! -s output/model_output.txt ] || [ "$(stat -c%s output/model_output.txt)" -lt 10 ]; then
+            echo "WARN: stdout empty — copying stderr as fallback"
+            cp output/llama_stderr.log output/model_output.txt
+          fi
+
+          # Strip REPL noise: ANSI codes, timing line, bare ">" prompt, "Exiting..."
+          sed -E \
+            -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+            -e '/^\[ Prompt: .*t\/s.*\]$/d' \
+            -e '/^Exiting\.\.\.$/d' \
+            -e '/^> *$/d' \
+            output/model_output.txt > output/clean_output.txt || cp output/model_output.txt output/clean_output.txt
+
+          # Hard fail if we still have nothing — don't silently produce empty reports.
+          CLEAN_SIZE=$(stat -c%s output/clean_output.txt)
+          echo "=== CLEAN size: ${CLEAN_SIZE} bytes ==="
+          if [ "$CLEAN_SIZE" -lt 5 ]; then
+            echo "ERROR: Model produced no usable output. See llama_stderr.log above."
+            exit 1
+          fi
+
+          echo "=== CLEAN OUTPUT ==="
+          cat output/clean_output.txt
 
       - name: Write response markdown
         if: github.event.inputs.mode != 'tool'
@@ -174,8 +201,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           mkdir -p output
-          python run_agent.py || AGENT_EXIT=$?
-          echo "Agent exit: ${AGENT_EXIT:-0}"
+          python run_agent.py
           if [ -f output/agent_result.json ]; then
             {
               echo "# Tool Mode Result"
