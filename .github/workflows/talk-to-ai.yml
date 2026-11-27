@@ -65,25 +65,62 @@ jobs:
 
       - name: Download llama.cpp binaries (CPU, Ubuntu x64)
         if: github.event.inputs.mode != 'tool'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! command -v jq &> /dev/null; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
-          ASSET_URL=$(curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30" \
-            | jq -r '
-                .[]
-                | select(.assets | any(.name | test("bin-ubuntu-x64\\.tar\\.gz$")))
-                | .assets[]
-                | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$"))
-                | .browser_download_url
-              ' | head -n 1)
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "ERROR: Could not find any release with bin-ubuntu-x64.tar.gz"
+
+          # Authenticated API call: raises rate limit from 60 to 5,000 req/hour.
+          API_RESPONSE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30")
+
+          # Guard: if the response is not an array, it's an error object.
+          IS_ARRAY=$(echo "$API_RESPONSE" | jq -r 'if type == "array" then "yes" else "no" end')
+          if [ "$IS_ARRAY" != "yes" ]; then
+            echo "ERROR: GitHub API did not return an array. Response was:"
+            echo "$API_RESPONSE" | head -c 1000
+            echo ""
+            echo "This is usually a rate limit or auth issue. Falling back to a known-good tag."
+            # Fallback: use a specific build tag that is known to exist.
+            # You can update this tag later if it gets deleted.
+            FALLBACK_TAG="b12776"
+            ASSET_URL="https://github.com/ggml-org/llama.cpp/releases/download/${FALLBACK_TAG}/llama-${FALLBACK_TAG}-bin-ubuntu-x64.tar.gz"
+            echo "Downloading fallback asset: $ASSET_URL"
+            curl -L -o llama.tar.gz "$ASSET_URL"
+          else
+            # Extract the first Ubuntu x64 CPU tarball from the array.
+            ASSET_URL=$(echo "$API_RESPONSE" \
+              | jq -r '
+                  .[]
+                  | select(.assets | any(.name | test("bin-ubuntu-x64\\.tar\\.gz$")))
+                  | .assets[]
+                  | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$"))
+                  | .browser_download_url
+                ' | head -n 1)
+
+            if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+              echo "ERROR: Could not find any release with bin-ubuntu-x64.tar.gz in the last 30 releases."
+              echo "Available assets in the newest release:"
+              echo "$API_RESPONSE" | jq -r '.[0].assets[].name' 2>/dev/null || true
+              exit 1
+            fi
+
+            echo "Downloading: $ASSET_URL"
+            curl -L -o llama.tar.gz "$ASSET_URL"
+          fi
+
+          # Verify the download is a valid tar.gz
+          if ! tar -tzf llama.tar.gz > /dev/null 2>&1; then
+            echo "ERROR: Downloaded file is not a valid tar.gz. Contents:"
+            file llama.tar.gz
+            head -c 200 llama.tar.gz
             exit 1
           fi
-          echo "Downloading: $ASSET_URL"
-          curl -L -o llama.tar.gz "$ASSET_URL"
+
           mkdir -p llama && tar -xzf llama.tar.gz -C llama
+          echo "--- Extracted binaries: ---"
           find llama -type f -name "llama-cli" -executable
 
       - name: Run inference with llama-cli
@@ -91,15 +128,14 @@ jobs:
         run: |
           LLAMA_CLI=$(find llama -type f -name "llama-cli" | head -n 1)
           if [ -z "$LLAMA_CLI" ]; then
-            echo "ERROR: llama-cli not found"
+            echo "ERROR: llama-cli not found after extraction."
             exit 1
           fi
           chmod +x "$LLAMA_CLI"
           mkdir -p output
 
           # Conversation mode (chat template applied) + /exit via stdin.
-          # No -no-cnv anywhere: it disables the chat template and recent
-          # llama.cpp builds don't accept the single-dash form.
+          # No -no-cnv: it disables the chat template and newer builds reject it.
           printf '/exit\n' | "$LLAMA_CLI" \
             -m models/nanbeige-reassembled.gguf \
             -p "$PROMPT" \
@@ -135,7 +171,7 @@ jobs:
             -e '/^> *$/d' \
             output/model_output.txt > output/clean_output.txt || cp output/model_output.txt output/clean_output.txt
 
-          # Hard fail if we still have nothing — don't silently produce empty reports.
+          # Hard fail if we still have nothing.
           CLEAN_SIZE=$(stat -c%s output/clean_output.txt)
           echo "=== CLEAN size: ${CLEAN_SIZE} bytes ==="
           if [ "$CLEAN_SIZE" -lt 5 ]; then
